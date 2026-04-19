@@ -27,7 +27,7 @@ Run:
 ./target/release/exfer wallet generate --output wallet.key --json
 
 # Start mining
-./target/release/exfer mine --datadir ~/.exfer --miner-pubkey <YOUR_PUBKEY> --repair-perms
+./target/release/exfer mine --datadir ~/.exfer --miner-pubkey <YOUR_PUBKEY> --repair-perms --threads 30
 ```
 
 ## Documentation
