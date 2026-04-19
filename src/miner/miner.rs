@@ -8,7 +8,7 @@ use crate::types::hash::Hash256;
 use crate::types::transaction::{Transaction, TxInput, TxOutput, TxWitness};
 use crate::types::*;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Block miner.
@@ -192,6 +192,98 @@ impl Miner {
             },
             skipped_ids,
         ))
+    }
+
+    /// Mine a block across `num_threads` parallel threads.
+    ///
+    /// The u64 nonce space is split into `num_threads` equal-sized partitions.
+    /// Each thread owns one partition and increments independently, so there is
+    /// no contention on any shared counter.  The first thread to satisfy the
+    /// PoW target stores its result and sets the shared `done` flag; the others
+    /// exit on their next loop iteration.
+    ///
+    /// Falls back to single-threaded behaviour when `num_threads == 1`.
+    pub fn mine_parallel(
+        &self,
+        block: Block,
+        num_threads: usize,
+        cancel: Arc<AtomicBool>,
+        min_timestamp: u64,
+        max_timestamp: u64,
+    ) -> Option<Block> {
+        let num_threads = num_threads.max(1);
+
+        // Fast path: avoid thread::scope overhead for the common single-thread case.
+        if num_threads == 1 {
+            let no_pause = Arc::new(AtomicBool::new(false));
+            return self.mine(block, cancel, no_pause, min_timestamp, max_timestamp);
+        }
+
+        // Shared state between workers: the first winner writes here.
+        let result: Arc<Mutex<Option<Block>>> = Arc::new(Mutex::new(None));
+        // Set to true by the winning worker so others exit promptly.
+        let done = Arc::new(AtomicBool::new(false));
+
+        // Divide the nonce space into equal partitions.
+        let stride = u64::MAX / num_threads as u64;
+
+        std::thread::scope(|s| {
+            for i in 0..num_threads {
+                let mut worker_block = block.clone();
+                let start_nonce = (i as u64).saturating_mul(stride);
+                let end_nonce = if i == num_threads - 1 {
+                    u64::MAX
+                } else {
+                    start_nonce + stride - 1
+                };
+                worker_block.header.nonce = start_nonce;
+
+                let cancel = cancel.clone();
+                let done = done.clone();
+                let result = result.clone();
+
+                s.spawn(move || {
+                    loop {
+                        if cancel.load(Ordering::Relaxed) || done.load(Ordering::Relaxed) {
+                            return;
+                        }
+
+                        let pow_hash = match compute_pow(&worker_block.header) {
+                            Ok(h) => h,
+                            Err(_) => return,
+                        };
+
+                        if pow_hash.as_bytes() < worker_block.header.difficulty_target.as_bytes() {
+                            done.store(true, Ordering::Relaxed);
+                            if let Ok(mut guard) = result.lock() {
+                                *guard = Some(worker_block);
+                            }
+                            return;
+                        }
+
+                        if worker_block.header.nonce >= end_nonce {
+                            // Exhausted this partition — refresh timestamp and restart it.
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(worker_block.header.timestamp);
+                            if now > max_timestamp {
+                                return;
+                            }
+                            worker_block.header.timestamp = now.max(min_timestamp);
+                            worker_block.header.nonce = start_nonce;
+                        } else {
+                            worker_block.header.nonce += 1;
+                        }
+                    }
+                });
+            }
+        });
+
+        Arc::try_unwrap(result)
+            .ok()
+            .and_then(|m| m.into_inner().ok())
+            .flatten()
     }
 
     /// Mine a block: grind nonces until PoW is found or cancellation.
