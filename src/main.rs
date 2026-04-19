@@ -105,7 +105,7 @@ fn parse_amount(s: &str) -> Result<u64, String> {
 /// Cargo version is reserved for eventual crates.io publication and
 /// follows its own semver, while the release tag is what the network and
 /// binary releases track.
-pub const RELEASE_TAG: &str = "1.5.2";
+pub const RELEASE_TAG: &str = "1.4.2";
 
 #[derive(Parser)]
 #[command(name = "exfer", about = "Exfer blockchain node", version = RELEASE_TAG)]
@@ -180,6 +180,9 @@ enum Commands {
         /// even below the hardcoded checkpoint height.
         #[arg(long)]
         no_assume_valid: bool,
+        /// Number of threads to use for mining (default: 1).
+        #[arg(long, default_value = "1")]
+        threads: usize,
     },
     /// Wallet operations
     Wallet {
@@ -774,7 +777,7 @@ async fn main() {
             no_assume_valid,
         } => {
             let peers = default_peers_if_empty(peers);
-            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid).await {
+            if let Err(e) = run_node(bind, peers, datadir, None, repair_perms, rpc_bind, verify_all, no_assume_valid, 1).await {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
             }
@@ -791,6 +794,7 @@ async fn main() {
             rpc_bind,
             verify_all,
             no_assume_valid,
+            threads,
         } => {
             let pubkey = if let Some(hex_str) = miner_pubkey {
                 let bytes = hex::decode(&hex_str).unwrap_or_else(|e| {
@@ -813,7 +817,7 @@ async fn main() {
             };
             let peers = default_peers_if_empty(raw_peers);
             if let Err(e) =
-                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid).await
+                run_node(bind, peers, datadir, Some(pubkey), repair_perms, rpc_bind, verify_all, no_assume_valid, threads).await
             {
                 error!("Node failed to start: {e}");
                 std::process::exit(1);
@@ -3113,6 +3117,7 @@ async fn run_node(
     rpc_bind: Option<SocketAddr>,
     verify_all: bool,
     no_assume_valid: bool,
+    mining_threads: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let assume_valid = !no_assume_valid && !verify_all;
     std::fs::create_dir_all(&datadir)
@@ -3520,8 +3525,6 @@ async fn run_node(
         assume_valid,
         assume_valid_verified: std::sync::atomic::AtomicBool::new(checkpoint_proven),
         frame_budget: network::frame_budget::FrameBudget::new(),
-        tip_validation_coord: Arc::new(network::tip_validation::TipValidationCoordinator::new()),
-        assume_valid_cumulative_work_trusted: std::sync::atomic::AtomicBool::new(true),
     });
 
     let listen_node = node.clone();
@@ -3556,7 +3559,7 @@ async fn run_node(
     if let Some(pubkey) = miner_pubkey {
         let mine_node = node.clone();
         tokio::spawn(async move {
-            mining_loop(mine_node, pubkey).await;
+            mining_loop(mine_node, pubkey, mining_threads).await;
         });
     }
 
@@ -3632,7 +3635,7 @@ async fn run_node(
     Ok(())
 }
 
-async fn mining_loop(node: Arc<Node>, pubkey: [u8; 32]) {
+async fn mining_loop(node: Arc<Node>, pubkey: [u8; 32], mining_threads: usize) {
     let miner = Miner::new(pubkey);
 
     loop {
@@ -3806,14 +3809,11 @@ async fn mining_loop(node: Arc<Node>, pubkey: [u8; 32]) {
 
         let template_clone = template;
         let miner_clone = miner.clone();
-        // No pause flag needed — block processing runs in the sync manager task,
-        // not competing with mining for the same thread.
-        let no_pause = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let result = tokio::task::spawn_blocking(move || {
-            miner_clone.mine(
+            miner_clone.mine_parallel(
                 template_clone,
+                mining_threads,
                 cancel_clone,
-                no_pause,
                 min_timestamp,
                 max_timestamp,
             )
